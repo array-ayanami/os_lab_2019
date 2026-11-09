@@ -11,14 +11,29 @@
 #include <sys/wait.h>
 
 #include <getopt.h>
+#include <signal.h>
 
 #include "find_min_max.h"
 #include "utils.h"
+
+pid_t *child_pids = NULL;
+int total_pids = 0;
+
+void handle_alarm(int sig) {
+    printf("\nTimeout reached! Killing all child processes...\n");
+    for (int i = 0; i < total_pids; i++) {
+        if (child_pids[i] > 0) {
+            kill(child_pids[i], SIGKILL);
+        }
+    }
+    exit(1);
+}
 
 int main(int argc, char **argv) {
   int seed = -1;
   int array_size = -1;
   int pnum = -1;
+  int timeout = -1;
   bool with_files = false;
   
   // Указатель для динамического массива pipe-каналов
@@ -31,6 +46,7 @@ int main(int argc, char **argv) {
                                       {"array_size", required_argument, 0, 0},
                                       {"pnum", required_argument, 0, 0},
                                       {"by_files", no_argument, 0, 'f'},
+                                      {"timeout", required_argument, 0, 0},
                                       {0, 0, 0, 0}};
 
     int option_index = 0;
@@ -66,6 +82,13 @@ int main(int argc, char **argv) {
           case 3:
             with_files = true;
             break;
+          case 4:
+            timeout = atoi(optarg);
+            if (timeout <= 0) {
+              printf("Error: timeout must be > 0\n");
+              return 1;
+            }
+            break;
 
           default:
             printf("Index %d is out of options\n", option_index);
@@ -89,7 +112,7 @@ int main(int argc, char **argv) {
   }
 
   if (seed == -1 || array_size == -1 || pnum == -1) {
-    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" \n",
+    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" [--timeout \"num\"]\n",
            argv[0]);
     return 1;
   }
@@ -107,9 +130,17 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
+
+  child_pids = malloc(sizeof(pid_t) * pnum);
+  total_pids = pnum;
   
   struct timeval start_time;
   gettimeofday(&start_time, NULL);
+
+  if (timeout > 0) {
+      signal(SIGALRM, handle_alarm);
+      alarm(timeout);
+  }
 
   for (int i = 0; i < pnum; i++) {
     pid_t child_pid = fork();
@@ -145,7 +176,10 @@ int main(int argc, char **argv) {
           free(pipes);
         }
         free(array);
+        free(child_pids);
         return 0;
+      } else {
+        child_pids[i] = child_pid;
       }
 
     } else {
@@ -155,9 +189,33 @@ int main(int argc, char **argv) {
   }
 
   while (active_child_processes > 0) {
-    wait(NULL);
+    int status;
+    pid_t wpid = waitpid(-1, &status, WNOHANG);
+    
+    if (wpid > 0) {
+        active_child_processes -= 1;
+    } else if (wpid == 0) {
+        usleep(10000);
+    } else {
+        if (active_child_processes > 0 && timeout > 0) {
+            break;
+        }
+    }
+  }
 
-    active_child_processes -= 1;
+  if (active_child_processes > 0) {
+      printf("Error: Execution stopped due to timeout. Total active children left: %d\n", active_child_processes);
+      if (pipes != NULL) {
+        for (int i = 0; i < pnum; i++) free(pipes[i]);
+        free(pipes);
+      }
+      free(array);
+      free(child_pids);
+      return 1;
+  }
+
+  if (timeout > 0) {
+      alarm(0);
   }
 
   struct MinMax min_max;
@@ -173,21 +231,24 @@ int main(int argc, char **argv) {
       sprintf(filename, "child_%d.txt", i);
       FILE *f = fopen(filename, "r");
       if (f != NULL) {
-        fscanf(f, "%d %d", &min, &max);
+        if (fscanf(f, "%d %d", &min, &max) == 2) {
+            if (min < min_max.min) min_max.min = min;
+            if (max > min_max.max) min_max.max = max;
+        }
         fclose(f);
         remove(filename); // Удаляем за собой временный файл
       }
     } else {
       struct MinMax local_min_max;
       close(pipes[i][1]); // Закрываем запись в родительском процессе
-      read(pipes[i][0], &local_min_max, sizeof(struct MinMax));
+      if (read(pipes[i][0], &local_min_max, sizeof(struct MinMax)) > 0) {
+          min = local_min_max.min;
+          max = local_min_max.max;
+          if (min < min_max.min) min_max.min = min;
+          if (max > min_max.max) min_max.max = max;
+      }
       close(pipes[i][0]); // Закрываем чтение после получения данных
-      min = local_min_max.min;
-      max = local_min_max.max;
     }
-
-    if (min < min_max.min) min_max.min = min;
-    if (max > min_max.max) min_max.max = max;
   }
 
   struct timeval finish_time;
@@ -202,6 +263,7 @@ int main(int argc, char **argv) {
     free(pipes);
   }
   free(array);
+  free(child_pids);
 
   printf("Min: %d\n", min_max.min);
   printf("Max: %d\n", min_max.max);
